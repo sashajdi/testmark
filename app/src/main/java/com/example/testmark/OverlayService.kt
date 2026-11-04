@@ -4,6 +4,8 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -29,6 +31,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
@@ -36,6 +39,9 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.abs
 
 data class Mark(val r: RectF, val letter: String)
@@ -64,10 +70,84 @@ class MarksView(c: Context) : View(c) {
     }
 }
 
+class SelectView(c: Context, private val bmp: Bitmap, private val onDone: (Bitmap?) -> Unit) : View(c) {
+    private var x0 = 0f
+    private var y0 = 0f
+    private var x1 = 0f
+    private var y1 = 0f
+    private var dragging = false
+    private val scrim = Paint().apply { color = Color.argb(150, 0, 0, 0) }
+    private val border = Paint().apply {
+        color = Color.rgb(66, 133, 244); style = Paint.Style.STROKE; strokeWidth = 5f; isAntiAlias = true
+    }
+    private val hint = Paint().apply {
+        color = Color.WHITE; textSize = 42f; isAntiAlias = true; setShadowLayer(6f, 0f, 0f, Color.BLACK)
+    }
+    private val dst = RectF()
+
+    override fun onDraw(c: Canvas) {
+        dst.set(0f, 0f, width.toFloat(), height.toFloat())
+        c.drawBitmap(bmp, null, dst, null)
+        c.drawRect(dst, scrim)
+        if (dragging) {
+            val l = minOf(x0, x1)
+            val t = minOf(y0, y1)
+            val r = maxOf(x0, x1)
+            val b = maxOf(y0, y1)
+            c.save()
+            c.clipRect(l, t, r, b)
+            c.drawBitmap(bmp, null, dst, null)
+            c.restore()
+            c.drawRect(l, t, r, b, border)
+        } else {
+            c.drawText("Обведіть завдання пальцем", 40f, 160f, hint)
+        }
+    }
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        when (e.action) {
+            MotionEvent.ACTION_DOWN -> {
+                x0 = e.x; y0 = e.y; x1 = e.x; y1 = e.y
+                dragging = true
+                invalidate()
+            }
+            MotionEvent.ACTION_MOVE -> {
+                x1 = e.x; y1 = e.y
+                invalidate()
+            }
+            MotionEvent.ACTION_UP -> {
+                x1 = e.x; y1 = e.y
+                dragging = false
+                val l = minOf(x0, x1).coerceIn(0f, width.toFloat())
+                val t = minOf(y0, y1).coerceIn(0f, height.toFloat())
+                val r = maxOf(x0, x1).coerceIn(0f, width.toFloat())
+                val b = maxOf(y0, y1).coerceIn(0f, height.toFloat())
+                if (r - l < 40f || b - t < 40f) {
+                    onDone(null)
+                } else {
+                    val kx = bmp.width / width.toFloat()
+                    val ky = bmp.height / height.toFloat()
+                    val x = (l * kx).toInt().coerceIn(0, bmp.width - 1)
+                    val y = (t * ky).toInt().coerceIn(0, bmp.height - 1)
+                    val w = ((r - l) * kx).toInt().coerceIn(1, bmp.width - x)
+                    val h = ((b - t) * ky).toInt().coerceIn(1, bmp.height - y)
+                    onDone(Bitmap.createBitmap(bmp, x, y, w, h))
+                }
+            }
+            MotionEvent.ACTION_CANCEL -> onDone(null)
+        }
+        return true
+    }
+}
+
 class OverlayService : Service() {
     private lateinit var wm: WindowManager
-    private lateinit var btn: TextView
     private lateinit var marksView: MarksView
+    private lateinit var checkBtn: TextView
+    private lateinit var askBtn: TextView
+    private val buttons = ArrayList<TextView>()
+    private var panel: View? = null
+    private var selectView: View? = null
     private var projection: MediaProjection? = null
     private var reader: ImageReader? = null
     private var vd: VirtualDisplay? = null
@@ -76,6 +156,7 @@ class OverlayService : Service() {
     private var sh = 0
     private var busy = false
     private val clearMarks = Runnable { marksView.setMarks(emptyList()) }
+    private val type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -98,8 +179,8 @@ class OverlayService : Service() {
             NotificationChannel("c", "TestMark", NotificationManager.IMPORTANCE_LOW)
         )
         val n = Notification.Builder(this, "c")
-            .setContentTitle("TestMark работает")
-            .setContentText("Долгое нажатие на кнопку выключает приложение")
+            .setContentTitle("TestMark працює")
+            .setContentText("Довге натискання на кнопку вимикає застосунок")
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .build()
         if (Build.VERSION.SDK_INT >= 29) {
@@ -135,36 +216,45 @@ class OverlayService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun setupOverlay() {
-        val d = resources.displayMetrics.density
-        val size = (52 * d).toInt()
-        val type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-
-        marksView = MarksView(this)
-        val mlp = WindowManager.LayoutParams(
+    private fun fullScreenParams(touchable: Boolean): WindowManager.LayoutParams {
+        var f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        if (!touchable) f = f or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
-            type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
+            type, f, PixelFormat.TRANSLUCENT
         )
         if (Build.VERSION.SDK_INT >= 28) {
-            mlp.layoutInDisplayCutoutMode =
+            lp.layoutInDisplayCutoutMode =
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
-        wm.addView(marksView, mlp)
+        return lp
+    }
 
-        btn = TextView(this).apply {
-            text = "✓"
+    private fun setupOverlay() {
+        val d = resources.displayMetrics.density
+        val prefs = getSharedPreferences("s", Context.MODE_PRIVATE)
+        val dp = (prefs.getString("size", "52")?.toIntOrNull() ?: 52).coerceIn(36, 100)
+        val size = (dp * d).toInt()
+
+        marksView = MarksView(this)
+        wm.addView(marksView, fullScreenParams(false))
+
+        checkBtn = makeButton("✓", Color.argb(210, 22, 163, 74), 400, size) { startCapture(false) }
+        askBtn = makeButton("?", Color.argb(210, 66, 133, 244), 400 + size + 24, size) { startCapture(true) }
+    }
+
+    private fun makeButton(label: String, color: Int, startY: Int, size: Int, onClick: () -> Unit): TextView {
+        val tv = TextView(this).apply {
+            text = label
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
             textSize = 22f
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
-                setColor(Color.argb(210, 22, 163, 74))
+                setColor(color)
             }
         }
         val lp = WindowManager.LayoutParams(
@@ -175,14 +265,14 @@ class OverlayService : Service() {
         )
         lp.gravity = Gravity.TOP or Gravity.START
         lp.x = 20
-        lp.y = 400
+        lp.y = startY
 
         var sx = 0f
         var sy = 0f
         var ox = 0
         var oy = 0
         var moved = false
-        btn.setOnTouchListener { _, e ->
+        tv.setOnTouchListener { _, e ->
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
                     sx = e.rawX; sy = e.rawY; ox = lp.x; oy = lp.y; moved = false
@@ -195,36 +285,35 @@ class OverlayService : Service() {
                     if (moved) {
                         lp.x = ox + dx
                         lp.y = oy + dy
-                        wm.updateViewLayout(btn, lp)
+                        wm.updateViewLayout(tv, lp)
                     }
                     true
                 }
                 MotionEvent.ACTION_UP -> {
                     if (!moved) {
-                        if (e.eventTime - e.downTime > 700) stopSelf() else onTap()
+                        if (e.eventTime - e.downTime > 700) stopSelf() else onClick()
                     }
                     true
                 }
                 else -> false
             }
         }
-        wm.addView(btn, lp)
+        wm.addView(tv, lp)
+        buttons.add(tv)
+        return tv
     }
 
     private fun toast(t: String) {
         main.post { Toast.makeText(this, t, Toast.LENGTH_LONG).show() }
     }
 
-    private fun setBtn(t: String) {
-        main.post { btn.text = t }
-    }
-
-    private fun onTap() {
+    private fun startCapture(select: Boolean) {
         if (busy) return
         busy = true
         main.removeCallbacks(clearMarks)
         marksView.setMarks(emptyList())
-        btn.visibility = View.INVISIBLE
+        hidePanel()
+        buttons.forEach { it.visibility = View.INVISIBLE }
         Thread {
             Thread.sleep(350)
             var bmp: Bitmap? = null
@@ -234,14 +323,19 @@ class OverlayService : Service() {
                     if (bmp == null) Thread.sleep(150)
                 }
             }
-            main.post { btn.visibility = View.VISIBLE }
+            main.post { buttons.forEach { it.visibility = View.VISIBLE } }
             val b = bmp
             if (b == null) {
-                toast("Не удалось сделать снимок, попробуй ещё раз")
+                toast("Не вдалося зробити знімок. Перезапустіть застосунок і у вікні запису екрана виберіть «Весь екран»")
                 busy = false
+            } else if (select) {
+                main.post {
+                    busy = false
+                    showSelect(b)
+                }
             } else {
-                setBtn("…")
-                ask(b)
+                main.post { checkBtn.text = "…" }
+                runTest(b)
             }
         }.start()
     }
@@ -259,40 +353,132 @@ class OverlayService : Service() {
         }
     }
 
-    private fun ask(bmp: Bitmap) {
-        try {
-            val prefs = getSharedPreferences("s", Context.MODE_PRIVATE)
-            val key = prefs.getString("key", "") ?: ""
-            val model = prefs.getString("model", "gemini-2.5-flash") ?: "gemini-2.5-flash"
+    private fun showSelect(frozen: Bitmap) {
+        hideSelect()
+        val sv = SelectView(this, frozen) { crop ->
+            main.post {
+                hideSelect()
+                if (crop != null) runAnswer(crop)
+            }
+        }
+        wm.addView(sv, fullScreenParams(true))
+        selectView = sv
+    }
 
-            val scale = 1280f / maxOf(bmp.width, bmp.height)
-            val small = if (scale < 1f) {
-                Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true)
-            } else bmp
-            val bos = ByteArrayOutputStream()
-            small.compress(Bitmap.CompressFormat.JPEG, 85, bos)
-            val b64 = Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+    private fun hideSelect() {
+        selectView?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        selectView = null
+    }
 
-            val prompt = "На скриншоте тест с вопросами и вариантами ответа. " +
-                "Для каждого видимого вопроса выбери правильный вариант. " +
-                "Верни JSON-массив объектов вида " +
-                "{\"q\": номер вопроса, \"letter\": буква или цифра варианта, " +
-                "\"reason\": не более 6 слов, " +
-                "\"box_2d\": [ymin, xmin, ymax, xmax] строки выбранного варианта в координатах 0-1000}. " +
-                "Если не уверен в вопросе, пропусти его."
+    private fun pill(t: String, color: Int, onClick: () -> Unit): TextView {
+        val d = resources.displayMetrics.density
+        return TextView(this).apply {
+            text = t
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setPadding((18 * d).toInt(), (10 * d).toInt(), (18 * d).toInt(), (10 * d).toInt())
+            background = GradientDrawable().apply {
+                cornerRadius = 24 * d
+                setColor(color)
+            }
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            lp.rightMargin = (10 * d).toInt()
+            layoutParams = lp
+            setOnClickListener { onClick() }
+        }
+    }
 
-            val parts = JSONArray()
-                .put(JSONObject().put("text", prompt))
-                .put(
-                    JSONObject().put(
-                        "inline_data",
-                        JSONObject().put("mime_type", "image/jpeg").put("data", b64)
-                    )
+    private fun showPanel(t: String) {
+        main.post {
+            hidePanel()
+            val d = resources.displayMetrics.density
+            val pd = (14 * d).toInt()
+            val box = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(pd, pd, pd, pd)
+                setBackgroundColor(Color.argb(240, 28, 28, 30))
+            }
+            val tv = TextView(this).apply {
+                text = t
+                setTextColor(Color.WHITE)
+                textSize = 16f
+                maxLines = 14
+            }
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, pd, 0, 0)
+            }
+            row.addView(pill("Копіювати", Color.rgb(66, 133, 244)) {
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("answer", t))
+                Toast.makeText(this, "Скопійовано", Toast.LENGTH_SHORT).show()
+            })
+            row.addView(pill("Закрити", Color.rgb(90, 90, 95)) { hidePanel() })
+            box.addView(tv)
+            box.addView(row)
+            val lp = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                type,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                PixelFormat.TRANSLUCENT
+            )
+            lp.gravity = Gravity.BOTTOM
+            wm.addView(box, lp)
+            panel = box
+        }
+    }
+
+    private fun hidePanel() {
+        panel?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        panel = null
+    }
+
+    private fun b64(bmp: Bitmap): String {
+        val scale = 1280f / maxOf(bmp.width, bmp.height)
+        val small = if (scale < 1f) {
+            Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true)
+        } else bmp
+        val bos = ByteArrayOutputStream()
+        small.compress(Bitmap.CompressFormat.JPEG, 88, bos)
+        return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+    }
+
+    private fun bodyFor(prompt: String, bmp: Bitmap, json: Boolean): JSONObject {
+        val parts = JSONArray()
+            .put(JSONObject().put("text", prompt))
+            .put(
+                JSONObject().put(
+                    "inline_data",
+                    JSONObject().put("mime_type", "image/jpeg").put("data", b64(bmp))
                 )
-            val body = JSONObject()
-                .put("contents", JSONArray().put(JSONObject().put("parts", parts)))
-                .put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
+            )
+        val body = JSONObject()
+            .put("contents", JSONArray().put(JSONObject().put("parts", parts)))
+        if (json) {
+            body.put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
+        }
+        return body
+    }
 
+    private fun errText(c: Int): String = when (c) {
+        429 -> "Ліміт запитів вичерпано. Зачекайте хвилину або спробуйте завтра"
+        500, 503 -> "Сервери Google перевантажені. Спробуйте ще раз через хвилину"
+        404 -> "Модель не знайдена. Змініть назву моделі в налаштуваннях застосунку"
+        400, 403 -> "Помилка $c. Перевірте ключ у налаштуваннях"
+        else -> "Помилка $c"
+    }
+
+    private fun post(body: JSONObject): JSONObject? {
+        val prefs = getSharedPreferences("s", Context.MODE_PRIVATE)
+        val key = prefs.getString("key", "") ?: ""
+        val model = prefs.getString("model", "gemini-3.5-flash") ?: "gemini-3.5-flash"
+        var lastCode = 0
+        for (attempt in 1..3) {
             val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$key")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
@@ -301,53 +487,47 @@ class OverlayService : Service() {
             conn.readTimeout = 60000
             conn.setRequestProperty("Content-Type", "application/json")
             conn.outputStream.use { it.write(body.toString().toByteArray()) }
-
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val resp = stream.bufferedReader().readText()
-            if (code !in 200..299) {
-                toast("Ошибка $code. Проверь ключ и название модели")
-                return
+            val resp = stream?.bufferedReader()?.readText() ?: ""
+            lastCode = code
+            if (code in 200..299) return JSONObject(resp)
+            if (code == 503 || code == 500 || code == 429) {
+                Thread.sleep(2000L * attempt)
+            } else {
+                break
             }
-
-            val text = JSONObject(resp).getJSONArray("candidates").getJSONObject(0)
-                .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
-            val arr = JSONArray(text)
-            val marks = ArrayList<Mark>()
-            val notes = StringBuilder()
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                val b = o.optJSONArray("box_2d") ?: continue
-                val r = RectF(
-                    (b.getDouble(1) / 1000.0 * sw).toFloat(),
-                    (b.getDouble(0) / 1000.0 * sh).toFloat(),
-                    (b.getDouble(3) / 1000.0 * sw).toFloat(),
-                    (b.getDouble(2) / 1000.0 * sh).toFloat()
-                )
-                val letter = o.optString("letter", "?")
-                marks.add(Mark(r, letter))
-                notes.append(o.optString("q", "")).append(" → ").append(letter)
-                    .append(": ").append(o.optString("reason", "")).append("\n")
-            }
-            main.post {
-                marksView.setMarks(marks)
-                main.postDelayed(clearMarks, 10000)
-            }
-            if (notes.isNotEmpty()) toast(notes.toString().trim()) else toast("Вопросов не найдено")
-        } catch (e: Exception) {
-            toast("Ошибка: ${e.message}")
-        } finally {
-            busy = false
-            setBtn("✓")
         }
+        toast(errText(lastCode))
+        return null
     }
 
-    override fun onDestroy() {
-        try { wm.removeView(btn) } catch (_: Exception) {}
-        try { wm.removeView(marksView) } catch (_: Exception) {}
-        vd?.release()
-        reader?.close()
-        projection?.stop()
-        super.onDestroy()
+    private fun textOf(r: JSONObject): String {
+        val parts = r.getJSONArray("candidates").getJSONObject(0)
+            .getJSONObject("content").getJSONArray("parts")
+        val sb = StringBuilder()
+        for (i in 0 until parts.length()) sb.append(parts.getJSONObject(i).optString("text", ""))
+        return sb.toString()
     }
-}
+
+    private fun updateStats(r: JSONObject) {
+        val tokens = r.optJSONObject("usageMetadata")?.optLong("totalTokenCount", 0L) ?: 0L
+        val p = getSharedPreferences("s", Context.MODE_PRIVATE)
+        val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        val same = p.getString("day", "") == today
+        p.edit()
+            .putString("day", today)
+            .putInt("req", (if (same) p.getInt("req", 0) else 0) + 1)
+            .putLong("tok", (if (same) p.getLong("tok", 0L) else 0L) + tokens)
+            .putLong("last", tokens)
+            .apply()
+    }
+
+    private fun runAnswer(crop: Bitmap) {
+        busy = true
+        main.post { askBtn.text = "…" }
+        Thread {
+            try {
+                val prompt = "На зображенні фрагмент екрана із завданням або питанням. " +
+                    "Дай коротку відповідь українською, не більше 40 слів, без вступів. " +
+                    "Якщо є варіанти відповіді, спершу назви правильний варіант, потім дуже коротке пояснення
